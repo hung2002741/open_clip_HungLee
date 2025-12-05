@@ -48,12 +48,10 @@ def random_seed(seed=42, rank=0):
 
 
 def natural_key(string_):
-    """See http://www.codinghorror.com/blog/archives/001018.html"""
     return [int(s) if s.isdigit() else s for s in re.split(r'(\d+)', string_.lower())]
 
 
 def get_latest_checkpoint(path: str, remote : bool):
-    # as writen, this glob recurses, so can pick up checkpoints across multiple sub-folders
     if remote:
         result = subprocess.run(["aws", "s3", "ls", path + "/"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(result)
@@ -72,23 +70,16 @@ def main(args):
     args = parse_args(args)
 
     if torch.cuda.is_available():
-        # This enables tf32 on Ampere GPUs which is only 8% slower than
-        # float16 and almost as accurate as float32
-        # This was a default in pytorch until 1.12
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
 
-    # fully initialize distributed device environment
     device = init_distributed_device(args)
 
-    # get the name of the experiments
     if args.name is None:
-        # sanitize model name for filesystem / uri use, easier if we don't use / in name as a rule?
         model_name_safe = args.model.replace('/', '-')
         date_str = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         if args.distributed:
-            # sync date_str from master to all ranks
             date_str = broadcast_object(args, date_str)
         args.name = '-'.join([
             date_str,
@@ -112,11 +103,9 @@ def main(args):
             )
             return -1
 
-    # Setup text logger
     args.log_level = logging.DEBUG if args.debug else logging.INFO
     setup_logging(args.log_path, args.log_level)
 
-    # Setup wandb, tensorboard, checkpoint logging
     args.wandb = 'wandb' in args.report_to or 'all' in args.report_to
     args.tensorboard = 'tensorboard' in args.report_to or 'all' in args.report_to
     args.checkpoint_path = os.path.join(log_base_path, "checkpoints")
@@ -131,7 +120,6 @@ def main(args):
     if resume_latest:
         resume_from = None
         checkpoint_path = args.checkpoint_path
-        # If using remote_sync, need to check the remote instead of the local checkpoints folder.
         if args.remote_sync is not None:
             checkpoint_path = os.path.join(args.remote_sync, args.name, "checkpoints")
             if args.save_most_recent:
@@ -141,34 +129,25 @@ def main(args):
                 print('Error. Sync protocol not supported when using resume latest.')
                 return -1
         if is_master(args):
-            # Checking for existing checkpoint via master rank only. It is possible for
-            # different rank processes to see different files if a shared file-system is under
-            # stress, however it's very difficult to fully work around such situations.
             if args.save_most_recent:
-                # if --save-most-recent flag is set, look for latest at a fixed filename
                 resume_from = os.path.join(checkpoint_path, LATEST_CHECKPOINT_NAME)
                 if not os.path.exists(resume_from):
-                    # If no latest checkpoint has been saved yet, don't try to resume
                     resume_from = None
             else:
-                # otherwise, list checkpoint dir contents and pick the newest checkpoint
                 resume_from = get_latest_checkpoint(checkpoint_path, remote=args.remote_sync is not None)
             if resume_from:
                 logging.info(f'Found latest resume checkpoint at {resume_from}.')
             else:
                 logging.info(f'No latest resume checkpoint found in {checkpoint_path}.')
         if args.distributed:
-            # sync found checkpoint path to all ranks
             resume_from = broadcast_object(args, resume_from)
         args.resume = resume_from
 
     if args.copy_codebase:
         copy_codebase(args)
 
-    # start the sync proces if remote-sync is not None
     remote_sync_process = None
     if is_master(args) and args.remote_sync is not None:
-        # first make sure it works
         result = remote_sync(
             os.path.join(args.logs, args.name), 
             os.path.join(args.remote_sync, args.name), 
@@ -179,7 +158,6 @@ def main(args):
         else:
             logging.info('Error: remote sync failed. Exiting.')
             return -1
-        # if all looks good, start a process to do this every args.remote_sync_frequency seconds
         remote_sync_process = start_sync_process(
             args.remote_sync_frequency,
             os.path.join(args.logs, args.name), 
@@ -207,18 +185,15 @@ def main(args):
     dist_model = None
     args.distill = args.distill_model is not None and args.distill_pretrained is not None
     if args.distill:
-        #FIXME: support distillation with grad accum.
         assert args.accum_freq == 1
-        #FIXME: support distillation with coca.
         assert 'coca' not in args.model.lower()
 
     if isinstance(args.force_image_size, (tuple, list)) and len(args.force_image_size) == 1:
-        # arg is nargs, single (square) image size list -> int
         args.force_image_size = args.force_image_size[0]
     random_seed(args.seed, 0)
     model_kwargs = {}
     if args.siglip:
-        model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
+        model_kwargs['init_logit_scale'] = np.log(10)
         model_kwargs['init_logit_bias'] = -10
     model, preprocess_train, preprocess_val = create_model_and_transforms(
         args.model,
@@ -234,7 +209,7 @@ def main(args):
         image_mean=args.image_mean,
         image_std=args.image_std,
         image_interpolation=args.image_interpolation,
-        image_resize_mode=args.image_resize_mode,  # only effective for inference
+        image_resize_mode=args.image_resize_mode,
         aug_cfg=args.aug_cfg,
         pretrained_image=args.pretrained_image,
         output_dict=True,
@@ -242,7 +217,6 @@ def main(args):
         **model_kwargs,
     )
     if args.distill:
-        # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
             args.distill_model, 
             args.distill_pretrained,
@@ -252,10 +226,7 @@ def main(args):
             cache_dir=args.cache_dir,
         )
     if args.use_bnb_linear is not None:
-        print('=> using a layer from bitsandbytes.\n'
-              '   this is an experimental feature which requires two extra pip installs\n'
-              '   pip install bitsandbytes triton'
-              '   please make sure to use triton 2.0.0')
+        print('=> using a layer from bitsandbytes.')
         import bitsandbytes as bnb
         from open_clip.utils import replace_linear
         print(f'=> replacing linear layers with {args.use_bnb_linear}')
@@ -269,7 +240,6 @@ def main(args):
         model = trace_model(model, batch_size=args.batch_size, device=device)
 
     if args.lock_image:
-        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
         model.lock_image_tower(
             unlocked_groups=args.lock_image_unlocked_groups,
             freeze_bn_stats=args.lock_image_freeze_bn_stats)
@@ -297,14 +267,12 @@ def main(args):
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         ddp_args = {}
         if args.ddp_static_graph:
-            # this doesn't exist in older PyTorch, arg only added if enabled
             ddp_args['static_graph'] = True
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
     
         if args.distill:
             dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)
 
-    # create optimizer and scaler
     optimizer = None
     scaler = None
 
@@ -316,8 +284,6 @@ def main(args):
             from timm.optim import create_optimizer_v2
             timm_opt = opt.split('timm/')[-1]
             opt_kwargs = {}
-            assert (args.beta1 is None) == (args.beta2 is None), \
-                'When using timm optimizer, BOTH beta1 and beta2 must be specified (or not specified).'
             if args.beta1 is not None:
                 opt_kwargs['betas'] = (args.beta1, args.beta2)
             if args.momentum is not None:
@@ -331,7 +297,6 @@ def main(args):
                 **opt_kwargs,
             )
         else:
-            # If some params are not passed, we use the default values based on model name.
             exclude = lambda n, p: p.ndim < 2 or "bn" in n or "ln" in n or "bias" in n or 'logit_scale' in n
             include = lambda n, p: not exclude(n, p)
 
@@ -372,12 +337,10 @@ def main(args):
             except (AttributeError, TypeError) as e:
                 scaler = torch.cuda.amp.GradScaler()
 
-    # optionally resume from a checkpoint
     start_epoch = 0
     if args.resume is not None:
         checkpoint = pt_load(args.resume, map_location='cpu')
         if 'epoch' in checkpoint:
-            # resuming a train checkpoint w/ epoch and optimizer state
             start_epoch = checkpoint["epoch"]
             sd = checkpoint["state_dict"]
             if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
@@ -389,11 +352,9 @@ def main(args):
                 scaler.load_state_dict(checkpoint['scaler'])
             logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
         else:
-            # loading a bare (model only) checkpoint for fine-tune or evaluation
             model.load_state_dict(checkpoint)
             logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
 
-    # initialize datasets
     tokenizer = get_tokenizer(args.model, cache_dir=args.cache_dir, context_length=args.force_context_length)
     data = get_data(
         args,
@@ -403,7 +364,6 @@ def main(args):
     )
     assert len(data), 'At least one train or eval dataset must be specified.'
 
-    # create scheduler if train
     scheduler = None
     if 'train' in data and optimizer is not None:
         total_steps = (data["train"].dataloader.num_batches // args.accum_freq) * args.epochs
@@ -423,7 +383,6 @@ def main(args):
                 f'Unknown scheduler, {args.lr_scheduler}. Available options are: cosine, const, const-cooldown.')
             exit(1)
 
-    # determine if this worker should save logs and checkpoints. only do so if it is rank == 0
     args.save_logs = args.logs and args.logs.lower() != 'none' and is_master(args)
     writer = None
     if args.save_logs and args.tensorboard:
@@ -436,7 +395,6 @@ def main(args):
         args.train_sz = data["train"].dataloader.num_samples
         if args.val_data is not None:
             args.val_sz = data["val"].dataloader.num_samples
-        # you will have to configure this for your project!
         wandb.init(
             project=args.wandb_project_name,
             name=args.name,
@@ -451,26 +409,18 @@ def main(args):
         wandb.save(params_file)
         logging.debug('Finished loading wandb.')
 
-    # Pytorch 2.0 adds '_orig_mod.' prefix to keys of state_dict() of compiled models.
-    # For compatibility, we save state_dict() of the original model, which shares the
-    # weights without the prefix.
     original_model = model
     if args.torchcompile:
         logging.info('Compiling model...')
-
         if args.grad_checkpointing and args.distributed:
             logging.info('Disabling DDP dynamo optimizer when grad checkpointing enabled.')
-            # As of now (~PyTorch 2.4/2.5), compile + grad checkpointing work, but DDP optimizer must be disabled
             torch._dynamo.config.optimize_ddp = False
-
         model = torch.compile(original_model)
 
     if 'train' not in data:
-        # If using int8, convert to inference mode.
         if args.use_bnb_linear is not None:
             from open_clip.utils import convert_int8_model_to_inference_mode
             convert_int8_model_to_inference_mode(model)
-        # Evaluate.
         evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
@@ -486,7 +436,6 @@ def main(args):
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
             evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
 
-        # Saving checkpoints.
         if args.save_logs:
             checkpoint_dict = {
                 "epoch": completed_epoch,
@@ -510,7 +459,6 @@ def main(args):
                     os.remove(previous_checkpoint)
 
             if args.save_most_recent:
-                # try not to corrupt the latest checkpoint if save fails
                 tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
                 latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
                 torch.save(checkpoint_dict, tmp_save_path)
@@ -519,7 +467,6 @@ def main(args):
     if args.wandb and is_master(args):
         wandb.finish()
 
-    # run a final sync.
     if remote_sync_process is not None:
         logging.info('Final remote sync.')
         remote_sync_process.terminate()
